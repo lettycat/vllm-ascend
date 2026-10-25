@@ -4,6 +4,8 @@ import hashlib
 import math
 import os
 import queue
+import re
+import os as _os
 import random
 import struct
 import threading
@@ -83,6 +85,65 @@ DONE_RECVING_MSG = b"done_recving_msg"
 # number of peers is larger than max_workers. Yield after a small FIFO batch so
 # other peers already waiting in the global executor queue can make progress.
 MAX_REQUESTS_PER_PEER_HANDLER = 5
+
+
+
+
+def _ced_detect_swa_groups(kv_cache_config) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Recognise the SWA groups the producer never sends.
+
+    Returns ``(missing, draft_only)``:
+
+    * ``missing``: 128-window SWA groups whose member layer indices are all
+      >= 20 -- i.e. the upper-half SWA groups (``(7,8,9,10,11)`` in the
+      delivery shape).  This tuple **is a cross-instance contract**: the
+      producer ships it in the transfer params and the decoder compares it
+      byte for byte (see ``get_num_new_matched_tokens``), so both sides must
+      compute exactly the same value.
+    * ``draft_only``: 128-window SWA groups with **no** ``*.layers.N.*``
+      member at all -- i.e. the Aurora DSpark draft groups
+      (``mtp.{0,1,2}.*``, ``(12,)`` in the delivery shape).  This is **not**
+      part of the cross-instance contract (the producer has no draft layers);
+      it only drives the decoder-local pre-zeroing and shape validation.
+
+    Needed in **both** classes: the scheduler side ``MooncakeConnector``
+    (which publishes the contract) and the worker side
+    ``MooncakeConnectorWorker`` (which pre-zeroes by group).  Computing it on
+    the scheduler side only makes ``start_load_kv`` raise
+    ``'MooncakeConnectorWorker' object has no attribute 'ced_draft_swa_groups'``
+    the moment the first request is processed -- invisible at start-up.
+    """
+    missing: list[int] = []
+    draft_only: list[int] = []
+    for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            # Value-based de-duplication (``not in`` uses ``__eq__``) rather
+            # than ``dict.fromkeys`` so we do not require the spec to be
+            # hashable.  This runs in the scheduler process and in all eight
+            # workers; any exception on either side is a start-up failure.
+            specs = []
+            for one in spec.kv_cache_specs.values():
+                if one not in specs:
+                    specs.append(one)
+        else:
+            specs = [spec]
+        if not all(getattr(s, "sliding_window", None) == 128 for s in specs):
+            continue
+        layer_indices = {
+            int(match.group(1))
+            for name in group.layer_names
+            if (match := re.search(r"\.layers\.(\d+)\.", name)) is not None
+        }
+        if layer_indices and min(layer_indices) >= 20:
+            missing.append(group_idx)
+        elif not layer_indices:
+            # No ``*.layers.N.*`` name at all implies a draft-layer group.
+            # ``group_cache_specs`` appends the draft groups **last**, so the
+            # index must be disjoint from the target groups 0..11 and must not
+            # be inserted in the middle.
+            draft_only.append(group_idx)
+    return tuple(missing), tuple(draft_only)
 
 
 class RemotePortInfo(TypedDict):
@@ -748,9 +809,9 @@ class KVCacheRecvingThread(threading.Thread):
             self._get_remote_metadata(remote_host, remote_handshake_port)
         with self.remote_metadata_lock:
             remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
-            local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
             remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
         session_id = f"{remote_host}:{remote_transfer_port}"
+        local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
 
         # With P-side PP the remote worker only owns its stage's
         # kv_cache_tensors. Offset the local (D) group-major flat addr list to
@@ -789,7 +850,18 @@ class KVCacheRecvingThread(threading.Thread):
 
         req_start_time = time.perf_counter()
         src_list, dst_list, length_list = [], [], []
-        for i in range(self.hma_group_size):
+        # [CED] The producer side has no DSpark, so it only ever publishes 12
+        # KV cache groups, while the decoder's DSpark-enabled engine has 13.
+        # The loop must follow the *shorter* of the two sides -- and in
+        # particular the remote (producer) length, because groups 12+ are
+        # decoder-local (pre-zeroed) and carry no remote blocks at all.
+        # Iterating `self.hma_group_size` unconditionally raised
+        # `IndexError: list index out of range` at `remote_block_ids[12]`, and
+        # because that happens on the worker's transfer thread the failure was
+        # only logged: execution continued with **no global KV transferred at
+        # all**, which presented as a content-blind decoder.
+        _group_count = min(self.hma_group_size, len(remote_block_ids), len(local_block_ids))
+        for i in range(_group_count):
             if not remote_block_ids[i] or not local_block_ids[i]:
                 continue
             cur_remote_block_ids = remote_block_ids[i]
@@ -1394,6 +1466,47 @@ class MooncakeConnectorScheduler:
             cdiv(n_tokens, block_size) + 1 if n_tokens else 0 for n_tokens, block_size in sw_sizes_tokens
         ]
 
+        # ---- CED (Causal Encoder-Decoder) role plumbing ----
+        # The producer runs layers 0..19 plus the layer-20 global source and
+        # never ships the upper-half SWA groups; the decoder owns those groups
+        # itself (pre-zero + bounded 128-token replay).
+        self.ced_role = os.environ.get("V41_CED_ROLE", "")
+        self.ced_missing_swa_groups: tuple[int, ...] = ()
+        self.ced_draft_swa_groups: tuple[int, ...] = ()
+        if self.ced_role:
+            if not self.use_compress:
+                raise ValueError("CED connector requires DeepSeek V4.1 compressed cache groups")
+            missing, draft_only = _ced_detect_swa_groups(kv_cache_config)
+            if self.ced_role == "prefill" and tuple(missing) != (7, 8, 9, 10, 11):
+                raise RuntimeError(f"CED producer expected upper SWA groups 7..11, got {list(missing)}")
+            if self.ced_role == "decode":
+                # [CED-DSPARK-GUARD] The producer's group indices must be a
+                # prefix of the decoder's.  If DSpark inserts a group in the
+                # middle, ``ced_missing_swa_groups`` (7..11) would point at the
+                # wrong groups and the connector would silently zero wrong
+                # pages -- turn that into a hard start-up error.
+                if tuple(missing) != (7, 8, 9, 10, 11):
+                    raise RuntimeError(
+                        "CED decoder expected the upper SWA groups at the same indices as "
+                        f"the producer (7..11), got {list(missing)}; P/D group-index alignment is a "
+                        "hard contract and DSpark must not insert groups before index 12"
+                    )
+                if draft_only and tuple(draft_only) != (len(kv_cache_config.kv_cache_groups) - 1,):
+                    raise RuntimeError(
+                        "CED decoder expected the Aurora DSpark draft group to be the last "
+                        f"group, got draft groups at {list(draft_only)} of "
+                        f"{len(kv_cache_config.kv_cache_groups)}"
+                    )
+            self.ced_missing_swa_groups = tuple(missing)
+            self.ced_draft_swa_groups = tuple(draft_only)
+            logger.info(
+                "CED %s: upper SWA groups=%s draft(g12) groups=%s total_groups=%s",
+                self.ced_role,
+                self.ced_missing_swa_groups,
+                self.ced_draft_swa_groups,
+                len(kv_cache_config.kv_cache_groups),
+            )
+
     def get_sw_clipped_blocks(self, block_ids: BlockIds) -> BlockIds:
         """
         Clip the number of blocks to the sliding window size for each kv cache group
@@ -1486,6 +1599,13 @@ class MooncakeConnectorScheduler:
         """
 
         params = request.kv_transfer_params
+        params = request.kv_transfer_params
+        if params is not None and params.get("ced_replay_tokens"):
+            if self.ced_role != "decode":
+                raise RuntimeError("CED replay metadata requires V41_CED_ROLE=decode")
+            _want = int(_os.environ.get("V41_CED_REPLAY_TOKENS", "128"))
+            if int(params["ced_replay_tokens"]) != _want or tuple(params.get("ced_missing_swa_groups", ())) != (7, 8, 9, 10, 11):
+                raise RuntimeError("CED decoder received an incompatible replay/cache-group contract")
         logger.debug(
             "MooncakeConnector get_num_new_matched_tokens: num_computed_tokens=%s, kv_transfer_params=%s",
             num_computed_tokens,
@@ -1516,7 +1636,29 @@ class MooncakeConnectorScheduler:
         if params is not None and params.get("do_remote_prefill"):
             if params.get("remote_block_ids"):
                 if all(p in params for p in ("remote_engine_id", "remote_host", "remote_port", "remote_request_id")):
-                    local_block_ids = blocks.get_unhashed_block_ids_all_groups() if num_external_tokens > 0 else []
+                    if num_external_tokens > 0:
+                        local_block_ids = blocks.get_unhashed_block_ids_all_groups()
+                    else:
+                        # [CED-FULL-HIT] On a whole-pool hit the stock semantics
+                        # are "nothing to pull" -> a bare ``[]``.  The CED
+                        # decoder contract however is "one list per group", and
+                        # a bare ``[]`` conflicts with the shape check in
+                        # ``start_load_kv``, killing the engine on long-context
+                        # full hits:
+                        #   RuntimeError: CED decoder expected 12 KV cache groups
+                        # Trigger condition measured: ``(prompt_len - 1) % 128 == 0``.
+                        #
+                        # Normalise to "twelve empty lists": ``sum(len(g))`` is
+                        # then 0 and the existing early-return branch in
+                        # ``_transfer_kv_cache_all_groups`` fires (no data, just
+                        # the completion signal), matching stock semantics.
+                        local_block_ids = tuple(() for _ in range(len(self.kv_cache_specs)))
+                        logger.info(
+                            "[CED-FULL-HIT] request %s whole-pool hit (num_external_tokens=0): "
+                            "no KV transfer, decoder reuses local cache + 128-token replay",
+                            request.request_id,
+                        )
+                    # Get unhashed blocks to pull from remote.
                     # Get unhashed blocks to pull from remote.
                     self._reqs_need_recv[request.request_id] = (request, local_block_ids, num_external_tokens)
                 else:
@@ -1580,6 +1722,14 @@ class MooncakeConnectorScheduler:
         # prompt length. Drop those unwritten blocks before SWA tail clipping.
         computed_block_ids = self._compute_transfer_block_ids(block_ids, request.num_prompt_tokens)
         computed_block_ids = self.get_sw_clipped_blocks(computed_block_ids)
+        if self.ced_role == "prefill":
+            # The producer only ran layers 0..19, so it never wrote the
+            # upper-half SWA groups.  Publish them as empty instead of sending
+            # stale/unwritten pages the decoder would otherwise trust.
+            block_lists = list(computed_block_ids)
+            for group_idx in self.ced_missing_swa_groups:
+                block_lists[group_idx] = []
+            computed_block_ids = tuple(block_lists)
         computed_block_lens = [len(block_id_list) for block_id_list in computed_block_ids]
         delay_free_blocks = sum(computed_block_lens) > 0
         if delay_free_blocks:
@@ -1588,7 +1738,7 @@ class MooncakeConnectorScheduler:
 
         num_prompt_blocks = math.ceil(request.num_prompt_tokens / self.block_size)
 
-        return delay_free_blocks, dict(
+        transfer_params = dict(
             do_remote_prefill=True,
             do_remote_decode=False,
             remote_block_ids=computed_block_ids,
@@ -1602,6 +1752,15 @@ class MooncakeConnectorScheduler:
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
         )
+        if self.ced_role == "prefill":
+            # Cross-instance CED contract: the decoder compares these values
+            # byte for byte, so the producer must publish its own group indices.
+            transfer_params.update(
+                ced_replay_tokens=int(_os.environ.get("V41_CED_REPLAY_TOKENS", "128")),
+                ced_missing_swa_groups=self.ced_missing_swa_groups,
+                ced_prefix_tokens=request.num_prompt_tokens,
+            )
+        return delay_free_blocks, transfer_params
 
     def _port_offset_from_handshake_metadata(self, rank_metadata: KVConnectorHandshakeMetadata, metadata_key) -> int:
         handshake_port = getattr(rank_metadata, "handshake_port", 0)
@@ -1691,6 +1850,31 @@ class MooncakeConnectorWorker:
             and len(kv_cache_config.kv_cache_groups) > 1
         )
         self.hma_group_size = len(kv_cache_config.kv_cache_groups)
+
+        # [CED] Pre-zeroing happens on the execution side, per group, so the
+        # worker side must resolve the very same group indices the scheduler
+        # used.  Computed here as well so both sides share one definition.
+        self.ced_role = os.environ.get("V41_CED_ROLE", "")
+        if self.ced_role:
+            self.ced_missing_swa_groups, self.ced_draft_swa_groups = _ced_detect_swa_groups(kv_cache_config)
+            if self.ced_role == "decode" and len(kv_cache_config.kv_cache_groups) != (
+                12 + len(self.ced_draft_swa_groups)
+            ):
+                raise RuntimeError(
+                    "CED decoder worker expected 12 producer groups plus the Aurora DSpark "
+                    f"draft groups, got {len(kv_cache_config.kv_cache_groups)} total and "
+                    f"draft={list(self.ced_draft_swa_groups)}"
+                )
+            logger.info(
+                "CED %s (worker): upper SWA groups=%s draft groups=%s total_groups=%s",
+                self.ced_role,
+                self.ced_missing_swa_groups,
+                self.ced_draft_swa_groups,
+                len(kv_cache_config.kv_cache_groups),
+            )
+        else:
+            self.ced_missing_swa_groups = ()
+            self.ced_draft_swa_groups = ()
 
         # Mamba metadata
         self._is_mamba_group = [isinstance(group.kv_cache_spec, MambaSpec) for group in kv_cache_config.kv_cache_groups]
@@ -1863,6 +2047,59 @@ class MooncakeConnectorWorker:
             ptrs = register_regions.ptrs
             lengths = register_regions.lengths
 
+        self.registered_kv_ranges = list(zip(ptrs, lengths, strict=True))
+        # [CED-32BIT-GUARD] Validate the pool against the 4 GiB page-addressing
+        # bound.  The layer-20 C1 page stride is 147712 B (131072 C1 KV +
+        # 16384 INT8 index K + 256 FP16 scales); once ``num_blocks * stride``
+        # exceeds 2**32 the operator's block address wraps onto a different
+        # block and a long-context request silently degrades into "HTTP 200 +
+        # wrong answer".  Measured here, on the decoder, at 36841 blocks:
+        # answers stayed coherent up to ~20K tokens and lost exactness beyond.
+        #
+        # The check uses the *page end* rather than the page start: the whole
+        # page must fit inside 4 GiB, i.e. ``num_blocks * max_page_stride <=
+        # 2**32``.  Checked here (not in the planner) because only here is the
+        # real stride and the final ``num_blocks`` available.
+        try:
+            _worst = 0
+            _worst_name = ""
+            for _layer_name, _kv in kv_caches.items():
+                _tensors = _kv if isinstance(_kv, (list, tuple)) else (_kv,)
+                for _single in _tensors:
+                    _stride_bytes = int(_single.stride(0)) * _single.element_size()
+                    if _stride_bytes > _worst:
+                        _worst, _worst_name = _stride_bytes, str(_layer_name)
+            if _worst > 0:
+                _limit = 1 << 32
+                _max_safe = _limit // _worst
+                _used = self.num_blocks * _worst
+                if _used > _limit:
+                    print(
+                        f"[CED-32BIT-GUARD] WARNING role={self.kv_role} num_blocks={self.num_blocks} "
+                        f"x max_page_stride={_worst} ({_worst_name}) = {_used} > 2^32={_limit}; "
+                        f"blocks >= {_max_safe} will wrap and silently read wrong data. "
+                        f"Cap the decoder pool (e.g. --kv-cache-memory) so that "
+                        f"num_blocks <= {_max_safe}.",
+                        flush=True,
+                    )
+                    if os.environ.get("V41_CED_STRICT_32BIT", "0") == "1":
+                        raise RuntimeError(
+                            "[CED-32BIT-GUARD] decoder pool exceeds the 4 GiB page-addressing bound: "
+                            f"num_blocks={self.num_blocks} x stride={_worst} = {_used} > 2^32. "
+                            "Long-context KV reads would wrap and silently corrupt."
+                        )
+                else:
+                    print(
+                        f"[CED-32BIT-GUARD] role={self.kv_role} num_blocks={self.num_blocks} "
+                        f"max_page_stride={_worst} ({_worst_name}) uses "
+                        f"{_used * 100 // _limit}% of the 4 GiB address space "
+                        f"(safe bound {_max_safe} blocks)",
+                        flush=True,
+                    )
+        except Exception as _exc:  # noqa: BLE001 - geometry probe must not break start-up
+            print(f"[CED-32BIT-GUARD] check skipped: {_exc!r}", flush=True)
+
+        global_te.register_buffer(ptrs, lengths)
         global_te.register_buffer(ptrs, lengths)
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
@@ -1927,6 +2164,31 @@ class MooncakeConnectorWorker:
                 raise RuntimeError("Timeout waiting for KV Cache thread to be ready.")
             time.sleep(3)
 
+    def get_registered_kv_block(self, base_index: int, block_id: int) -> torch.Tensor:
+        """Expose the actual transferred bytes for diagnostics, without raw pointers.
+
+        Hash this byte view rather than indexing a layer tensor: layer views
+        may start inside the registered page, particularly for compressed KV.
+        Call only while the request's blocks are still owned by the worker.
+        """
+        if not 0 <= base_index < len(self.kv_caches_base_addr):
+            raise ValueError("base_index must identify a registered transfer base")
+        if block_id < 0:
+            raise ValueError("block_id must be nonnegative")
+        start = self.kv_caches_base_addr[base_index] + block_id * self.block_stride_per_addr[base_index]
+        length = self.block_len_per_addr[base_index]
+        if not any(base <= start and start + length <= base + size for base, size in self.registered_kv_ranges):
+            raise ValueError("KV block is outside the registered transfer ranges")
+        for caches in self.kv_caches.values():
+            for tensor in as_kv_cache_tensors(caches):
+                storage = tensor.untyped_storage()
+                offset = start - storage.data_ptr()
+                if offset >= 0 and offset + length <= storage.nbytes():
+                    return torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
+                        storage, offset, (length,), (1,)
+                    )
+        raise ValueError("No backing tensor storage covers the registered KV block")
+
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_sending = (
             self.kv_send_thread.get_and_clear_finished_requests(  # type: ignore[union-attr]
@@ -1950,7 +2212,86 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
+        # [CED-FIX] Register the request ids with the task trackers BEFORE any
+        # request is handed to the worker threads.
+        #
+        # ``start_load_kv`` used to submit first and register afterwards:
+        #   (1) for req_id, meta in metadata.requests.items(): ... add_request()
+        #   (2) for req_id in metadata.reqs_in_batch: add_req_to_process(req_id)
+        # ``add_request`` only enqueues, and the receive thread is already
+        # running, so it can finish the request before the main thread reaches
+        # (2).  ``update_done_task_count`` then finds the id absent from
+        # ``reqs_to_process``, logs
+        #   "MooncakeConnector finish req not in reqs to process"
+        # and does not publish the completion.  The later (2) registers the id,
+        # so it stays in ``reqs_to_process`` forever, the scheduler never sees
+        # ``finished_recving`` and keeps the request parked in
+        # WAITING_FOR_REMOTE_KVS -- a silent deadlock with no traceback.
+        #
+        # CED makes this race reliably observable: the decoder only pulls the
+        # producer's global KV, and on a whole-pool hit the payload is *zero*
+        # blocks, so the worker returns almost instantly.  The stock decoder
+        # pulls the full prompt (many blocks) and usually loses the race.
+        for req_id in metadata.reqs_in_batch:
+            if self.kv_send_thread is not None:
+                self.kv_send_thread.task_tracker.add_req_to_process(req_id)
+            if self.kv_recv_thread is not None:
+                self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
         for req_id, meta in metadata.requests.items():
+            if os.environ.get("V41_CED_ROLE", "") == "decode":
+                # G7..G11 are deliberately absent from the producer transfer.
+                # Clear their decoder-local physical pages before any replay
+                # attention can read a stale allocation; this runs on the
+                # worker's NPU thread.
+                # [CED-DSPARK] With DSpark there is also a draft-only G12 which
+                # likewise never comes from the producer, so the pre-zero set
+                # covers it too.  The remote side is always 12 groups -- that
+                # contract is fixed by the producer (which has no DSpark).
+                expected_local_groups = 12 + len(self.ced_draft_swa_groups)
+                if len(meta.remote_block_ids) != 12 or len(meta.local_block_ids) != expected_local_groups:
+                    def _shape(x):
+                        try:
+                            return [len(g) if g is not None else -1 for g in x]
+                        except TypeError:
+                            return f"not-a-sequence ({type(x).__name__})"
+
+                    raise RuntimeError(
+                        f"CED decoder expected 12 remote (producer) and "
+                        f"{expected_local_groups} local KV cache groups "
+                        f"({len(self.ced_draft_swa_groups)} Aurora DSpark draft-only); "
+                        f"remote_groups={len(meta.remote_block_ids)} "
+                        f"remote_blocks_per_group={_shape(meta.remote_block_ids)} "
+                        f"local_groups={len(meta.local_block_ids)} "
+                        f"local_blocks_per_group={_shape(meta.local_block_ids)} "
+                        f"num_external_tokens={meta.num_external_tokens} "
+                        f"req={req_id}"
+                    )
+                if _os.environ.get("V41_CED_PREZERO_TRACE", "0") == "1":
+                    print(
+                        "[CED-PREZERO] groups=%s local_blocks=%s remote_blocks=%s"
+                        % (
+                            list(self.ced_missing_swa_groups) + list(self.ced_draft_swa_groups),
+                            [len(g) for g in meta.local_block_ids],
+                            [len(g) for g in meta.remote_block_ids],
+                        ),
+                        flush=True,
+                    )
+                for group_idx in (*self.ced_missing_swa_groups, *self.ced_draft_swa_groups):
+                    # The remote side only carries 12 groups (the producer has
+                    # no DSpark), so G12 does not exist there.
+                    if group_idx < len(meta.remote_block_ids) and meta.remote_block_ids[group_idx]:
+                        raise RuntimeError(f"CED upper SWA group {group_idx} unexpectedly has remote blocks")
+                    local_ids = meta.local_block_ids[group_idx]
+                    if not local_ids:
+                        continue
+                    for layer_name in self.kv_cache_config.kv_cache_groups[group_idx].layer_names:
+                        cache = self.kv_caches[layer_name]
+                        for tensor in cache if isinstance(cache, (tuple, list)) else (cache,):
+                            # Basic narrow() is a view, so zero_() only touches
+                            # the requested physical page.
+                            for block_id in local_ids:
+                                tensor.narrow(0, int(block_id), 1).zero_()
+                torch_npu.npu.synchronize()
             logger.debug(
                 "start_load_kv for request %s from remote engine %s. "
                 "Num local_block_ids: %s. Num remote_block_ids: %s. ",
@@ -2027,11 +2368,6 @@ class MooncakeConnectorWorker:
                         all_task_done=(i == tp_num_need_pulls * self._prefill_pp_size - 1),
                     )
 
-        for req_id in metadata.reqs_in_batch:
-            if self.kv_send_thread is not None:
-                self.kv_send_thread.task_tracker.add_req_to_process(req_id)
-            if self.kv_recv_thread is not None:
-                self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
 
         if self.kv_send_thread is not None:
             for req_id, delay_start_time in metadata.requests_to_send.items():

@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+import os as _os_ced
+
+_CED_PREFILL_ROLE = _os_ced.environ.get("V41_CED_ROLE", "") == "prefill"
+
 import typing
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
@@ -757,6 +761,19 @@ class DeepseekV41Attention(DeepseekV41SWAAttention):
         context = vllm_config.compilation_config.static_forward_context
         context[self.v41_layer_name] = self
 
+    def write_global_source_only(self, normalized_hidden_states):
+        """Write layer 20's global source without running query or attention.
+
+        CED prefill obtains this layer's main KV and Indexer K from the final
+        encoder state.  Reuse the regular attention implementation's writer so
+        the cache layout, RoPE and slot mapping stay identical.  This method
+        deliberately produces no SWA KV, attention output or logits; callers
+        must use it only inside a dedicated producer phase.
+        """
+        if self.role.layer_idx != 20 or not self.role.is_kv_source or self.role.compress_ratio != 1:
+            raise ValueError("CED source-only write requires the ratio-1 Full layer at index 20")
+        return self.v41_impl.ced_source_only(self, normalized_hidden_states)
+
     def forward(self, positions, hidden_states, llama_4_scaling=None):
         output = torch.empty_like(hidden_states)
         torch.ops.vllm.dsa_v41_forward(hidden_states, output, self.v41_layer_name)
@@ -876,6 +893,28 @@ class DeepseekV41DecoderLayer(nn.Module):
             comb.unsqueeze(0),
         ).squeeze(0)
 
+    def write_global_source_from_encoder(self, hidden_states, pre_mix):
+        """Project the layer-20 global source from the encoder output.
+
+        The normal layer-20 forward feeds ``hc_pre -> input_layernorm`` into
+        attention before writing its source.  Preserve that exact input path;
+        the surrounding layer's SWA, MoE and mHC post are not run here.  This
+        is the whole point of CED prefill: layers 21..39 are never executed,
+        yet the ratio-1 global KV / Indexer K at layer 20 is still published so
+        the decoder can replay against it.
+        """
+        if self.layer_idx != 20:
+            raise ValueError("CED decoder source projection belongs to layer 20")
+        x, _, _, _ = self.hc_pre(
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            pre_mix,
+        )
+        x = self.input_layernorm(x)
+        return self.self_attn.write_global_source_only(x)
+
     def forward(
         self,
         positions,
@@ -884,6 +923,12 @@ class DeepseekV41DecoderLayer(nn.Module):
         llama_4_scaling=None,
         input_ids=None,
     ):
+        if (
+            self.layer_idx >= int(_os_ced.environ.get("V41_CED_P_BREAK_AT", "20"))
+            and _CED_PREFILL_ROLE
+            and _os_ced.environ.get("V41_CED_P_NOBREAK", "0") != "1"
+        ):
+            raise RuntimeError("CED producer executed a decoder layer instead of source-only projection")
         use_sequence_parallel = getattr(self, "use_sequence_parallel", False)
         residual = hidden_states
         x, attn_post, attn_comb, attn_pre = self.hc_pre(
@@ -971,6 +1016,22 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         else:
             self.norm = PPMissingLayer()
 
+        # ---- CED producer (prefill) role ----
+        # The producer only runs the encoder half (0..19) plus layer 20's
+        # global source projection.  Its response is a transfer marker; the
+        # decoder owns layers 20..39 and the upper SWA groups.
+        _ced_role = _os_ced.environ.get("V41_CED_ROLE", "")
+        if _ced_role not in ("", "prefill", "decode"):
+            raise ValueError(f"Unsupported V41_CED_ROLE={_ced_role!r}")
+        self._ced_prefill_only = _ced_role == "prefill"
+        # Layer at which the CED producer stops (20 = source-only at layer 20).
+        self._ced_break_at = int(_os_ced.environ.get("V41_CED_P_BREAK_AT", "20"))
+        if self._ced_prefill_only:
+            print(
+                "[CED-P] internal producer: layers 0..19 plus layer-20 global source; "
+                "the response is a transfer marker, not an answer",
+                flush=True,
+            )
         self.hc_mult = config.hc_mult
         spec_config = vllm_config.speculative_config
         needs_mtp_hidden_states = spec_config is not None and (
@@ -1554,6 +1615,17 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         last_layer = None
         aux_hidden_states = []
         for layer in self.layers:
+            # [CED] The producer stops after the encoder half.  ``_ced_break_at``
+            # defaults to layer 20: layers 0..19 run normally and layer 20's
+            # global source is published by the dedicated source-only path.
+            # Moving it to 21 makes layer 20 run its full attention instead --
+            # kept as a switch because the source-only path and the normal
+            # forward must be numerically interchangeable, and that is easier
+            # to re-verify on the machine than to argue about.
+            if self._ced_prefill_only and layer.layer_idx == self._ced_break_at:
+                if layer.layer_idx == 20:
+                    layer.write_global_source_from_encoder(hidden_states, pre_mix)
+                break
             last_layer = layer
             # DSpark consumes the residual stream entering its configured
             # target layers. The runner expresses checkpoint IDs as one-based.
@@ -1780,6 +1852,19 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        if logits is not None and getattr(self.model, "_ced_prefill_only", False):
+            # The producer's Mooncake request must finish with LENGTH_CAPPED so
+            # ``request_finished_all_groups`` can publish its cache blocks.  The
+            # marker is a valid non-EOS token and explicitly *not* an answer.
+            # Never expose this dedicated producer endpoint as a chat service.
+            marker = 42
+            eos = self.config.eos_token_id
+            if marker >= logits.shape[-1] or marker == eos or (
+                isinstance(eos, (tuple, list)) and marker in eos
+            ):
+                raise RuntimeError("CED internal transfer marker conflicts with tokenizer")
+            logits.fill_(-10000.0)
+            logits[..., marker] = 0.0
         return logits
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

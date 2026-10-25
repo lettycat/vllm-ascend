@@ -10,6 +10,7 @@ moving cache or scheduler knowledge back into the model.
 
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+import os as _os
 from typing import Any
 
 import torch
@@ -192,6 +193,36 @@ class DeepseekV41PreparedIndexer:
     quantize_done: Any = None
 
 
+_CED_ROLE_ENV = _os.environ.get("V41_CED_ROLE", "")
+_CED_DECODE_ROLE = _CED_ROLE_ENV == "decode"
+# [CED-SWA-CLIP] The CED decoder's replay step rebases SMLA's ori(SWA) visible
+# window to the replay start.  Default on (this is the fix for the sporadic 1M
+# garbage output); set to 0 to restore the old behaviour for a single-variable
+# A/B inside one instance.
+_CED_SWA_CLIP = _os.environ.get("V41_CED_SWA_CLIP", "1") == "1"
+# Diagnostic-only: force the decoder to rewrite the layer-20 global source
+# even during a replay step (i.e. ignore the producer's global KV).  Used to
+# separate "the producer wrote the source wrong" from "the decode path is
+# wrong" -- never enable it in a delivery configuration.
+_CED_D_REWRITE_SOURCE = _os.environ.get("V41_CED_D_REWRITE_SOURCE", "0") == "1"
+
+
+def _ced_is_capturing() -> bool:
+    """Whether an ACL graph capture is in flight.
+
+    No D2H copy or temporary allocation may happen during capture.
+    """
+    try:
+        if getattr(get_forward_context(), "capturing", False):
+            return True
+    except Exception:  # noqa: BLE001 - get_forward_context asserts outside a forward
+        pass
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except Exception:  # noqa: BLE001 - some torch_npu builds lack this API
+        return False
+
+
 def compressed_slot_mapping(slot_mapping: torch.Tensor, ratio: int) -> torch.Tensor:
     """Convert original-token physical slots to completed compressed slots.
 
@@ -334,24 +365,36 @@ class AscendDSAV41Impl:
         q, qr = cls._project_q(attn, hidden_states, cos, sin)
         return q, qr, cls._project_kv(attn, hidden_states, cos, sin)
 
-    def _update_caches(self, attn, hidden_states, metadata):
+    def _update_caches(self, attn, hidden_states, metadata, *, replay_chunk=False):
         if hidden_states.shape[0] == 0:
             return
         positions = metadata.positions[: hidden_states.shape[0]]
         cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
         kv = self._project_kv(attn, hidden_states, cos, sin)
         AscendDSAV41Impl._write_swa_cache(attn, metadata.swa, kv)
-        if self.role.is_kv_source:
+        if self.role.is_kv_source and not replay_chunk:
             self._write_compressed_source(attn, hidden_states, positions, cos, sin, metadata)
 
-    def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix):
-        return self._preprocess(attn, hidden_states, hidden_states, metadata, metadata)
+    def _peek_swa_metadata(self, metadata_by_prefix, metadata):
+        """Return this layer's SWA metadata if resolvable, else None.
 
-    def _preprocess(self, attn, query_hidden, cache_hidden, query_metadata, cache_metadata):
+        Used only to decide whether the current step is a CED bounded replay.
+        """
+        try:
+            return metadata_by_prefix[self.swa_prefix]
+        except Exception:  # noqa: BLE001 - metadata may be a bare object during warmup
+            return getattr(metadata, "swa", None)
+
+    def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix, *, replay_chunk=False):
+        return self._preprocess(
+            attn, hidden_states, hidden_states, metadata, metadata, replay_chunk=replay_chunk
+        )
+
+    def _preprocess(self, attn, query_hidden, cache_hidden, query_metadata, cache_metadata, *, replay_chunk=False):
         query_hidden = query_hidden[: query_metadata.swa.num_actual_tokens]
         cache_hidden = cache_hidden[: cache_metadata.swa.num_actual_tokens]
         if not query_hidden.shape[0]:
-            self._update_caches(attn, cache_hidden, cache_metadata)
+            self._update_caches(attn, cache_hidden, cache_metadata, replay_chunk=replay_chunk)
             return None, None, None
         cos, sin = query_metadata.rope(attn.rotary_emb.layername, query_hidden.shape[0])
         kv_cos, kv_sin = cache_metadata.rope(attn.rotary_emb.layername, cache_hidden.shape[0])
@@ -374,7 +417,11 @@ class AscendDSAV41Impl:
         self._apply_rotary(attn, q, cos, sin)
         # Consume local Query RoPE before compression can reuse source tables.
         prepared_indexer = self._prepare_indexer_inputs(attn, query_hidden, qr, cos, sin, query_metadata)
-        if self.role.is_kv_source and cache_hidden.shape[0]:
+        if (
+            self.role.is_kv_source
+            and cache_hidden.shape[0]
+            and (not replay_chunk or _CED_D_REWRITE_SOURCE)
+        ):
             self._write_compressed_source(
                 attn,
                 cache_hidden,
@@ -610,7 +657,9 @@ class AscendDSAV41Impl:
             shared.candidates[: candidates.shape[0]].copy_(candidates)
         return shared.topk_indices[: hidden_states.shape[0]]
 
-    def _forward_attention(self, attn, q, metadata, compressed_indices, *, source_cache=None):
+    def _forward_attention(
+        self, attn, q, metadata, compressed_indices, *, source_cache=None, replay_chunk=False
+    ):
         """Run SparseFlashMla with the same PA metadata for both operator stages."""
         if source_cache is None and self.role.has_long_context:
             source_cache = get_forward_context().no_compile_layers[self.long_kv_source_prefix].kv_cache[0]
@@ -636,6 +685,89 @@ class AscendDSAV41Impl:
         query_start_loc = metadata.swa.query_start_loc[: num_reqs + 1]
         seq_lens = metadata.swa.seq_lens[:num_reqs]
         ori_block_table = metadata.swa.block_table[:num_reqs]
+        seqused_ori = seq_lens
+        # [CED-SWA-CLIP] The operator treats ``ori_block_table`` as
+        # [batch, maxblockNumPerBatch] with column = curS2Idx / paOriBlockSize.
+        # The decoder's SWA manager keeps only the last two pages, so the first
+        # replay query's 128-wide window reaches back into already-recycled
+        # columns (row entries are 0 = null block) and the kernel reads
+        # *physical block 0*, which after the pool wraps belongs to another
+        # request -> first-token EOS.
+        #
+        # Rebase the row table to the page holding each request's replay start
+        # and swap seqused_ori_kv for the relative length.  The mask boundary is
+        # derived by the kernel from the runtime seqUsedOriKV, so a narrowed
+        # table only ever touches columns 0..ceil(local/bs)-1.
+        #
+        # * Must use gather (a fresh contiguous tensor), not a slice view: the
+        #   kernel's row stride comes from dim(1) and a non-contiguous view
+        #   mis-addresses rows for bIdx > 0.
+        # * The trigger must be the same ``replay_chunk`` computed in forward();
+        #   an independent heuristic would also fire on profile runs (or any
+        #   future multi-token step), which is not bounded-replay semantics.
+        clip_wanted = _CED_SWA_CLIP and replay_chunk
+        if clip_wanted and metadata.swa.positions is None:
+            raise RuntimeError(
+                "CED SWA clip is enabled for a replay step but metadata.swa.positions "
+                "is missing; refusing to fall back to the un-clipped (buggy) path. "
+                "Set V41_CED_SWA_CLIP=0 to run the old behaviour on purpose."
+            )
+        if clip_wanted and _os.environ.get("V41_CED_CLIP_TRACE", "0") == "1" and self.role.layer_idx == 20:
+            print(
+                "[CED-CLIP-TRACE] bt_shape=%s bt_row0=%s seq_lens=%s qsl=%s pos0=%s posN=%s "
+                "logical_bs=%s storage_bs=%s max_q=%s"
+                % (
+                    tuple(metadata.swa.block_table.shape),
+                    metadata.swa.block_table[0].cpu().tolist(),
+                    metadata.swa.seq_lens[:4].cpu().tolist(),
+                    metadata.swa.query_start_loc[:3].cpu().tolist(),
+                    metadata.swa.positions[:2].cpu().tolist(),
+                    metadata.swa.positions[q.shape[0] - 2 : q.shape[0]].cpu().tolist(),
+                    metadata.swa.logical_block_size,
+                    metadata.swa.storage_block_size,
+                    metadata.swa.max_query_len,
+                ),
+                flush=True,
+            )
+        if clip_wanted and not _ced_is_capturing():
+            block_size = int(metadata.swa.logical_block_size) or int(metadata.swa.storage_block_size)
+            if block_size <= 0:
+                raise RuntimeError(
+                    "CED SWA clip needs a positive block size, got "
+                    f"logical={metadata.swa.logical_block_size} storage={metadata.swa.storage_block_size}"
+                )
+            positions_swa = metadata.swa.positions[: q.shape[0]]
+            query_starts = metadata.swa.query_start_loc[:num_reqs].to(torch.long)
+            first_positions = positions_swa.index_select(0, query_starts)
+            base_pages = torch.div(first_positions, block_size, rounding_mode="floor")
+            local_lens = seq_lens - base_pages.to(seq_lens.dtype) * block_size
+            num_pages = int((int(local_lens.max().item()) + block_size - 1) // block_size)
+            offsets = torch.arange(num_pages, device=base_pages.device, dtype=torch.long)
+            columns = base_pages[:, None] + offsets[None, :]
+            ori_block_table = torch.gather(metadata.swa.block_table[:num_reqs], 1, columns)
+            if not ori_block_table.is_contiguous():
+                raise RuntimeError("CED SWA clip produced a non-contiguous block table")
+            seqused_ori = local_lens
+            if _os.environ.get("V41_CED_CLIP_TRACE", "0") == "1" and self.role.layer_idx == 20:
+                print(
+                    "[CED-CLIP] base_pages=%s local_lens=%s num_pages=%d table=%s"
+                    % (
+                        base_pages.cpu().tolist(),
+                        local_lens.cpu().tolist(),
+                        num_pages,
+                        ori_block_table.cpu().tolist(),
+                    ),
+                    flush=True,
+                )
+            if _os.environ.get("V41_CED_SWA_TRACE", "0") == "1" and self.role.layer_idx in (2, 20):
+                print(
+                    f"[CED-SWA-CLIP] layer={self.role.layer_idx} block_size={block_size} "
+                    f"q_len={int(metadata.swa.max_query_len)} "
+                    f"base_pages={base_pages.cpu().tolist()} "
+                    f"seqused_ori={local_lens.cpu().tolist()} pages={num_pages} "
+                    f"seq_lens={seq_lens.cpu().tolist()}",
+                    flush=True,
+                )
         cmp_block_table = None
         cmp_seq_lens = None
         cmp_residual = None
@@ -664,7 +796,7 @@ class AscendDSAV41Impl:
             ori_block_table=ori_block_table,
             cmp_block_table=cmp_block_table,
             cu_seqlens_q=query_start_loc,
-            seqused_ori_kv=seq_lens,
+            seqused_ori_kv=seqused_ori,
             seqused_cmp_kv=cmp_seq_lens,
             cmp_residual_kv=cmp_residual,
             sinks=attn.attn_sink,
@@ -698,17 +830,48 @@ class AscendDSAV41Impl:
             output.zero_()
             return output
         metadata = self._get_layer_metadata(forward_context.attn_metadata)
+        # [CED-D] Bounded replay: the decoder re-runs at most 128 prompt tokens
+        # after receiving N-1 tokens of global KV.  On such a step the
+        # compressed/global source was already published by the producer, so it
+        # must not be rewritten, and the SWA window must be clipped to the
+        # replay start.  The trigger is computed here (not in the metadata
+        # builder) so profile runs and any future multi-token step keep the
+        # stock behaviour.
+        replay_chunk = _CED_DECODE_ROLE and not getattr(forward_context, "in_profile_run", False)
+        if replay_chunk:
+            _swa_meta = self._peek_swa_metadata(forward_context.attn_metadata, metadata)
+            replay_chunk = bool(_swa_meta is not None and _swa_meta.num_prefills > 0 and _swa_meta.max_query_len > 1)
+            if _os.environ.get("V41_CED_REPLAY_TRACE", "1") == "1" and self.role.layer_idx == 20:
+                print(
+                    f"[CED-D-TRACE] layer20 num_prefills={getattr(_swa_meta, 'num_prefills', None)} "
+                    f"max_query_len={getattr(_swa_meta, 'max_query_len', None)} "
+                    f"num_actual_tokens={getattr(_swa_meta, 'num_actual_tokens', None)} "
+                    f"num_reqs={getattr(_swa_meta, 'num_reqs', None)} "
+                    f"replay_chunk={int(replay_chunk)}",
+                    flush=True,
+                )
+            _cap = int(_os.environ.get("V41_CED_REPLAY_TOKENS", "128"))
+            if replay_chunk and _swa_meta.max_query_len > _cap:
+                raise RuntimeError("CED decoder replay exceeded the configured cap")
         q, qr, prepared_indexer = self._prepare_inputs_and_caches(
-            attn, hidden_states, metadata, forward_context.attn_metadata
+            attn, hidden_states, metadata, forward_context.attn_metadata, replay_chunk=replay_chunk
         )
         num_tokens = metadata.swa.num_actual_tokens
         if num_tokens:
             positions = metadata.positions[:num_tokens]
             cos, sin = metadata.rope(attn.rotary_emb.layername, num_tokens)
+            if replay_chunk and self.role.layer_idx == 20 and not getattr(forward_context, "capturing", False):
+                print(
+                    f"[CED-D] replay chunk={metadata.swa.max_query_len}: "
+                    "reusing global source and C2 ring",
+                    flush=True,
+                )
             compressed_indices = self._select_sparse_indices(
                 attn, hidden_states, qr, positions, cos, sin, metadata, prepared_indexer
             )
-            attention_output = self._forward_attention(attn, q, metadata, compressed_indices)
+            attention_output = self._forward_attention(
+                attn, q, metadata, compressed_indices, replay_chunk=replay_chunk
+            )
             AscendDSAV41Impl._apply_rotary(attn, attention_output, cos, sin, inverse=True)
         else:
             heads = attn.n_heads if getattr(attn, "enable_dsa_cp", False) else attn.n_local_heads

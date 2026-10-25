@@ -1,3 +1,4 @@
+
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """V4.1 replicated-cache adapters for legacy TP-token CP and MRV2 PCP."""
@@ -186,10 +187,16 @@ class _ReplicatedCacheImpl(AscendDSAV41Impl):
 
 
 class AscendDSAV41CPImpl(_ReplicatedCacheImpl):
-    def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix):
+    def _prepare_inputs_and_caches(
+        self, attn, hidden_states, metadata, metadata_by_prefix, *, replay_chunk=False
+    ):
         global_metadata = self._global_layer_metadata(metadata_by_prefix)
         start, _, _, _ = metadata.swa.cp_token_range
-        return self._preprocess(attn, hidden_states[start:], hidden_states, metadata, global_metadata)
+        # [CED] Forward replay_chunk through the CP override as well.
+        return self._preprocess(
+            attn, hidden_states[start:], hidden_states, metadata, global_metadata,
+            replay_chunk=replay_chunk,
+        )
 
     def _indexer_hidden_states(self, hidden_states, metadata):
         start, _, _, _ = metadata.swa.cp_token_range
@@ -472,15 +479,22 @@ class AscendDSAV41PCPImpl(_ReplicatedCacheImpl):
         gathered = get_pcp_group().all_gather(hidden_states.contiguous(), dim=0)
         return torch.index_select(gathered, 0, metadata.hidden_restore_idx)
 
-    def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix):
+    def _prepare_inputs_and_caches(
+        self, attn, hidden_states, metadata, metadata_by_prefix, *, replay_chunk=False
+    ):
         if not isinstance(metadata.swa, AscendDSAV41PCPMetadata):
-            return super()._prepare_inputs_and_caches(attn, hidden_states, metadata, metadata_by_prefix)
+            return super()._prepare_inputs_and_caches(
+                attn, hidden_states, metadata, metadata_by_prefix, replay_chunk=replay_chunk
+            )
         # Empty query ranks also join hidden and weight collectives.
         global_hidden_states = self._gather_and_restore_hidden_states(hidden_states, metadata.swa)
         projector = attn.dsa_attn.dsa_attn.impl
         projector._maybe_all_gather_pcp_o_proj_weights()
         global_metadata = self._global_layer_metadata(metadata_by_prefix)
-        return self._preprocess(attn, hidden_states, global_hidden_states, metadata, global_metadata)
+        return self._preprocess(
+            attn, hidden_states, global_hidden_states, metadata, global_metadata,
+            replay_chunk=replay_chunk,
+        )
 
     def forward(self, attn, positions, hidden_states, output=None):
         metadata = get_forward_context().attn_metadata

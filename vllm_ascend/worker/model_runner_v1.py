@@ -20,7 +20,9 @@
 import logging
 import math
 import sys
+import os
 import time
+# [CED-PATCHED]
 from collections import defaultdict, deque
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -2374,6 +2376,24 @@ class NPUModelRunner(GPUModelRunner):
                         scheduler_output.num_common_prefix_blocks,
                     )
 
+                # CED decoder may receive N-1 prompt KV and then schedule the
+                # last prompt token alone.  The generic graph dispatcher
+                # otherwise treats this shape as uniform decode, while V4.1
+                # attention metadata still marks it as a prefill.  Keep that
+                # one prompt step eager; generated decode tokens continue to use
+                # the graph.
+                ced_prompt_tail_eager = (
+                    os.environ.get("V41_CED_ROLE") == "decode"
+                    and os.environ.get("V41_CED_GRAPH_PROMPT_TAIL_EAGER") == "1"
+                    and max_num_scheduled_tokens == 1
+                    and any(
+                        int(self.input_batch.num_computed_tokens_cpu_tensor[i])
+                        < int(self.input_batch.num_prompt_tokens_cpu_tensor[i])
+                        for i in range(num_reqs)
+                    )
+                )
+                if ced_prompt_tail_eager:
+                    logger.info("[CED-GRAPH] one-token prompt tail forced eager")
                 (
                     cudagraph_mode,
                     batch_desc,
@@ -2386,7 +2406,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
-                    force_eager=self.model_config.enforce_eager,
+                    force_eager=self.model_config.enforce_eager or ced_prompt_tail_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 

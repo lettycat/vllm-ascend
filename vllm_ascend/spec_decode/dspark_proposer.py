@@ -70,7 +70,9 @@ class AscendDSparkProposer(AscendDflashProposer):
                 device=device,
             )
         # DSpark runs eager only (Ascend cudagraph unsupported on this path).
-        self.use_cuda_graph = False
+        # [CED-TPOT] was: self.use_cuda_graph = False (eager only)
+        import os as _ct_os
+        self.use_cuda_graph = bool(int(_ct_os.environ.get('V41_DSPARK_GRAPH', '0')))
         # Max query tokens depend on whether sampling from anchor or not.
         self.max_query_tokens = self.max_batch_size * self.num_query_per_req
         # Position ids for the draft query block [max_query_tokens].

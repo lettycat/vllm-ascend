@@ -30,6 +30,40 @@ from .updatable_graph import (
     UpdatableGraph,
 )
 
+
+class _AG12:
+    __slots__ = ("on", "_acc", "_n")
+    def __init__(self):
+        import os as _o
+        self.on = _o.environ.get("V41_AG_PROF", "0") == "1"
+        self._acc = {}
+        self._n = 0
+    def add(self, k, dt_ms):
+        if not self.on:
+            return
+        a = self._acc.get(k)
+        if a is None:
+            self._acc[k] = [dt_ms, 1]
+        else:
+            a[0] += dt_ms
+            a[1] += 1
+        self._n += 1
+        if self._n >= 24:
+            self._n = 0
+            self.dump()
+    def dump(self):
+        try:
+            import time as _tt
+            rows = []
+            for k, (s, c) in self._acc.items():
+                rows.append("%s %s %.3f %d" % (_tt.time(), k, s / c, c))
+            with open("/dsv41/logs/ag12.jsonl", "a") as fh:
+                fh.write("\n".join(rows) + "\n")
+            self._acc = {}
+        except Exception:
+            pass
+_ag12 = _AG12()
+
 _acl_graph_wrappers: weakref.WeakSet[Any] = weakref.WeakSet()
 _STREAM_RESOURCE_ERROR_CODE = "207008"
 _STREAM_RESOURCE_ERROR_MARKERS = (
@@ -292,12 +326,24 @@ class ACLGraphWrapper:
         # When FULL + EAGLE draft (merge path), replay does not need this barrier.
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
+        # [AG13] allow disabling the per-step FULL-graph barrier for measurement.
+        # The barrier serializes host prep against the previous replay; when the
+        # engine's own batch queue already provides ordering it costs ~9 ms/step.
+        import os as _ag13o
+        if _ag13o.environ.get("V41_AG_NOSYNC", "0") == "1":
+            need_sync = False
         if not self.enable_enpu and need_sync:
+            import time as _ag12t
+            _ag12s = _ag12t.perf_counter()
             torch.npu.current_stream().synchronize()
+            _ag12.add('sync_full', (_ag12t.perf_counter()-_ag12s)*1000)
         if self.runtime_mode == CUDAGraphMode.FULL and use_updatable_graph(self.attn_backend):
             self._updatable_graph_replay(forward_context, entry.aclgraph)
         else:
+            import time as _ag12t2
+            _ag12r=_ag12t2.perf_counter()
             entry.aclgraph.replay()
+            _ag12.add('replay', (_ag12t2.perf_counter()-_ag12r)*1000)
         logger.info_once("ACL graph replay is active (logged once).")
         return entry.output
 
@@ -438,3 +484,4 @@ def update_draft_graph_prefill_params_workspaces(num_tokens: int, workspace: Any
 
 def get_draft_graph_prefill_params():
     return _draft_graph_prefill_params
+
